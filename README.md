@@ -2,7 +2,7 @@
 
 `ReferenceError: Property 'error' doesn't exist` when accessing a catch binding inside a deferred closure (`setTimeout`) in React Native with Hermes.
 
-Related: [facebook/hermes#864](https://github.com/facebook/hermes/issues/864)
+Related: [facebook/hermes#864](https://github.com/facebook/hermes/issues/864), [facebook/hermes#1969](https://github.com/facebook/hermes/issues/1969)
 
 ## The Bug
 
@@ -19,55 +19,46 @@ try {
 
 ## Reproduction
 
-This repo is a minimal React Native 0.79.7 project. The repro code is in `App.tsx`.
-
-### Prerequisites
-
-- Node.js 18+
-- Xcode 16+ (tested on Xcode 26.4)
-- CocoaPods
-- Ruby 3.3.x (Ruby 3.4 has a CocoaPods `kconv` incompatibility)
-
-### Steps
+`repro.js` contains code extracted from a React Native 0.79.7 Metro dev bundle. It replicates the exact execution path: Metro module system (`__d`/`__r`), React Native's JSTimers (which wraps all timer callbacks in `_allocateCallback` + `_callTimer` with its own `try/catch`), and the catch binding pattern.
 
 ```bash
-git clone https://github.com/ExodusMovement/hermes-catch-binding-bug.git
-cd hermes-catch-binding-bug
-npm install
-
-# iOS
-cd ios && bundle install && bundle exec pod install && cd ..
-npx react-native run-ios
-
-# Android
-npx react-native run-android
+hermes repro.js
 ```
 
-### Expected result
+**On standalone Hermes CLI:** prints `BUG NOT REPRODUCED` — the catch binding is accessible.
 
-The app displays **"BUG REPRODUCED – ReferenceError: Property 'error' doesn't exist"**.
+**Inside a React Native app (iOS/Android):** throws `ReferenceError: Property 'error' doesn't exist`.
 
-### Note: Xcode 26+ fmt build fix
+The same code, the same execution path — different result. The difference is the Hermes runtime embedded in the React Native app vs the standalone CLI binary.
 
-If the build fails with `fmt` compilation errors on Xcode 26+, the Podfile already includes a patch that upgrades `fmt` from 11.0.2 to 12.1.0. See [facebook/react-native#56099](https://github.com/facebook/react-native/pull/56099).
+### Verified in React Native app
 
-## Screenshot
+Tested with a fresh RN 0.79.7 project on iOS simulator (Xcode 26.4):
 
 ![Bug reproduced on iOS simulator](screenshot.png)
 
-## Root Cause
+## What's in repro.js
 
-Hermes has `enableBlockScoping: false` by default. When block scoping is disabled, [`prepareCatch`](https://github.com/facebook/hermes/blob/main/lib/IRGen/ESTreeIRGen-except.cpp) renames the catch binding to an internal `?anon_N_error` variable in the function scope and uses `NameTableScopeTy` to temporarily map the original name. When the catch block exits, the destructor removes the name mapping.
+Extracted from the Metro dev bundle, not hand-written:
 
-Babel's `@babel/plugin-transform-block-scoping` lowers `let`/`const` to `var` but does **not** transform catch bindings (block-scoped since ES3, expected to be engine-native). This creates a gap: nothing transforms catch bindings, and Hermes's internal workaround breaks for deferred closures.
+1. **Metro require polyfill** — `__d`/`__r`/`loadModuleImplementation` with `$RefreshReg$`/`$RefreshSig$` Fast Refresh globals (lines 1–400 of the bundle)
+2. **JSTimers** — React Native's `setTimeout` replacement that wraps callbacks via `_allocateCallback` → `_callTimer` with `try { callback() } catch (e) { errors.push(e) }` (lines 26261–26540)
+3. **App module** — the catch binding pattern, output by `@react-native/babel-preset` with `hermes-stable` profile (catch binding is **not** transformed by Babel)
 
-## Why standalone Hermes CLI does NOT reproduce
+## Babel verification
 
-The `hermes-engine-cli` binary does not reproduce this bug. It lacks an event loop, so closures are always invoked synchronously while the catch block's scope is still active. The ReferenceError only manifests when the closure executes on a **later event loop tick** — which requires the full React Native runtime. This is why [facebook/hermes#864](https://github.com/facebook/hermes/issues/864) was closed as "need-repro".
+`@react-native/babel-preset` with `hermes-stable` profile does **not** transform catch bindings:
+
+```
+Input:  catch (error) { setTimeout(function() { console.log(error) }, 0) }
+Output: catch (error) { setTimeout(function() { console.log(error) }, 0) }
+```
+
+Only `const`/`let` are lowered to `var`. The catch binding passes through untransformed.
 
 ## Workaround
 
-Hoist the catch binding to a `let` before the try/catch. Babel transforms `let` → `var`, which Hermes handles correctly:
+Hoist the catch binding to a `let` before the try/catch. Babel lowers `let` → `var`, which Hermes handles correctly:
 
 ```javascript
 let capturedError;
@@ -84,6 +75,6 @@ try {
 ## Environment
 
 - React Native 0.79.7 (also affects 0.78.x)
-- Hermes (default engine, `enableBlockScoping: false`)
-- Metro bundler
-- iOS and Android both affected
+- Hermes (default engine)
+- Metro bundler (dev mode)
+- Tested on iOS simulator
