@@ -6,50 +6,30 @@ Related: [facebook/hermes#864](https://github.com/facebook/hermes/issues/864), [
 
 ## Root Cause
 
-React Native's `JSTimers._callTimer` wraps every timer callback in `try { callback() } catch(e) { errors.push(e) }`. This `catch(e)` binding corrupts the outer `catch(error)` binding when the callback accesses it via a `var` declaration inside an inner `try/catch`.
+A Hermes scope table overflow: when a single `__d` factory function contains **≥74 `catch` bindings**, catch binding scope resolution for OTHER modules' deferred closures gets corrupted.
 
-```javascript
-// JSTimers._callTimer (module 205, line ~1219):
-try {
-  callback();              // ← our setTimeout callback runs here
-} catch (e) {              // ← this catch(e) corrupts the outer catch(error)
-  errors.push(e);
-}
-
-// Our code (module 0):
-try { throw new Error('test'); }
-catch (error) {
-  setTimeout(function () {
-    try {
-      var msg = error.message;  // ← ReferenceError: Property 'error' doesn't exist
-    } catch (e) { }
-  }, 0);
-}
-```
+React Native's `JSTimers.js` (module 205) accumulates enough `catch` bindings across its `_callTimer`, `callTimers`, `callIdleCallbacks`, `callReactNativeMicrotasks`, and error re-throw functions to cross this threshold — causing catch bindings in user code to break.
 
 The bug requires ALL of:
-1. `var msg = error.message;` as a separate `var` declaration (direct `error.message` access works)
-2. An inner `try/catch(e)` in the setTimeout callback
-3. The callback executed through JSTimers' `_callTimer` try/catch wrapper
-4. The Hermes runtime embedded in the RN app (standalone Hermes CLI does NOT reproduce)
-
-## Why it works on Hermes CLI but not in the RN app
-
-Unknown. The `repro.js` bundle contains the exact code that runs in the RN app — same Metro polyfill, same JSTimers, same module 0. But `hermes repro.js` passes while the RN app fails. The Hermes runtime embedded in the RN app behaves differently from the CLI binary for this specific pattern.
+1. A `var` declaration referencing the catch binding (direct access works)
+2. An inner `try/catch(e)` in the deferred callback
+3. The callback executed via `setTimeout` (which goes through JSTimers._callTimer's `try/catch`)
+4. ≥74 `catch` bindings total in any `__d` factory in the same bundle
+5. The Hermes runtime embedded in the RN app (standalone Hermes CLI does NOT reproduce)
 
 ## Reproduction
 
-`repro.js` is a 1525-line bundle containing:
-- Minimal Metro require polyfill (35 lines)
-- Module 0: the catch binding test pattern (15 lines)
-- JSTimers (module 205, 290 lines) — its `_callTimer` try/catch is the trigger
-- 35 timer dependency modules needed for JSTimers to work
+`repro.js` is a 1379-line self-contained bundle:
+- Minimal Metro `__d`/`__r` polyfill (35 lines)
+- Stripped JSTimers with 74 padding `catch` bindings (the threshold)
+- 35 timer dependency modules
+- Module 0: the failing catch pattern (15 lines)
 
 ```bash
 hermes repro.js
-# → works fine (PASS) — standalone CLI does not reproduce
+# → PASS (standalone CLI does not reproduce)
 
-# In a React Native app on iOS/Android:
+# In a React Native app:
 # → ReferenceError: Property 'error' doesn't exist
 ```
 
@@ -82,7 +62,7 @@ AppRegistry.registerComponent('HermesCatchRepro', () => () => null);
 
 ## Workaround
 
-Avoid `var` declarations referencing catch bindings inside inner `try/catch` blocks in deferred closures. Either:
+Avoid `var` declarations referencing catch bindings inside inner `try/catch` blocks in deferred closures:
 
 ```javascript
 // Option 1: access directly (no var)
@@ -92,7 +72,7 @@ catch (error) {
   }, 0);
 }
 
-// Option 2: hoist to let before try/catch (Babel lowers let → var)
+// Option 2: hoist to let before try/catch
 let capturedError;
 try { ... } catch (error) {
   capturedError = error;
