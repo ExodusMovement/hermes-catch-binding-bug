@@ -1,41 +1,68 @@
 # Hermes Catch Binding Bug
 
-`ReferenceError: Property 'error' doesn't exist` when accessing a catch binding inside a deferred closure in React Native with Hermes.
+`ReferenceError: Property 'error' doesn't exist` when accessing a catch binding inside a deferred closure in a React Native app with Hermes.
 
 Related: [facebook/hermes#864](https://github.com/facebook/hermes/issues/864), [facebook/hermes#1969](https://github.com/facebook/hermes/issues/1969)
 
-## The Bug
+## Root Cause
+
+A Hermes compiler bug where parsing a `__d` factory function containing a `catch` binding corrupts catch binding scope resolution for a **different** `__d` factory's deferred closure.
+
+Specifically, when the bundle contains this module definition (never executed, only parsed):
 
 ```javascript
-try {
-  throw new Error('test');
-} catch (error) {
-  console.log(error.message); // works
-  setTimeout(function () {
-    console.log(error.message); // ReferenceError: Property 'error' doesn't exist
-  }, 0);
-}
+__d(function (...) {
+  var handleError = function handleError(e, isFatal) {
+    try {
+      ExceptionsManager.handleException(e, isFatal);
+    } catch (ee) {                          // ← this catch(ee) corrupts scope
+      console.log('Failed to print error: ', ee.message);
+      throw e;
+    }
+  };
+}, 256, [...], "setUpErrorHandling.js");
 ```
 
-## Findings
+...it causes a catch binding in a separately defined module to become inaccessible in deferred closures:
 
-**All deferral methods fail** — not just `setTimeout` (native bridge), but also `Promise.resolve().then()` and `queueMicrotask()` (pure JS, no native bridge). This rules out the native timer implementation as the cause. The bug is in the Hermes runtime itself when embedded in the RN app.
+```javascript
+__d(function (...) {
+  try {
+    throw new Error('test');
+  } catch (error) {
+    setTimeout(function () {
+      try {
+        var msg = error.message;    // ← ReferenceError: Property 'error' doesn't exist
+      } catch (e) { }
+    }, 0);
+  }
+}, 0, [], "index.js");
+```
 
-| Deferral method | Native bridge? | Result in RN app |
-|---|---|---|
-| `setTimeout` | Yes | FAIL |
-| `Promise.resolve().then()` | No | FAIL |
-| `queueMicrotask()` | No | FAIL |
-
-All three work correctly on standalone Hermes CLI (`hermes repro.js`).
-
-![All three deferral methods fail in RN app](screenshot.png)
+The bug requires ALL of:
+1. `var msg = error.message;` as a separate `var` declaration (direct `error.message` access works)
+2. An inner `try/catch(e)` block in the setTimeout callback
+3. Deferred execution (setTimeout, Promise.then, queueMicrotask)
+4. Another `__d` factory in the bundle containing a `catch` binding (e.g. module 256)
+5. The Hermes runtime embedded in the RN app (standalone Hermes CLI does NOT reproduce)
 
 ## Reproduction
 
-`repro.js` — minimal Metro require polyfill (71 lines) replicating the RN execution path. Runs on standalone Hermes CLI but does **not** reproduce the bug there.
+`repro.js` is a 2811-line bundle containing:
+- Metro require polyfill + ErrorUtils (lines 1-1284)
+- Module 0: the catch binding test pattern (15 lines)
+- Module 256: `setUpErrorHandling.js` from React Native — the trigger (20 lines, never executed)
+- 37 timer modules needed for `setTimeout` to work
 
-To reproduce in an RN app:
+```bash
+hermes repro.js
+# → works fine (PASS) — standalone CLI does not reproduce
+
+# In a React Native app on iOS/Android:
+# → ReferenceError: Property 'error' doesn't exist
+```
+
+### Quick RN repro
 
 ```bash
 npx @react-native-community/cli init HermesCatchRepro --version 0.79.7
@@ -49,12 +76,12 @@ import {AppRegistry} from 'react-native';
 try {
   throw new Error('catch-binding-bug');
 } catch (error) {
-  console.log('inside catch:', error.message);
   setTimeout(function () {
     try {
-      console.log('deferred:', error.message);
+      var msg = error.message;
+      console.log(msg);
     } catch (e) {
-      console.error('BUG REPRODUCED:', e.message);
+      console.error('BUG:', e.message);
     }
   }, 100);
 }
@@ -64,23 +91,29 @@ AppRegistry.registerComponent('HermesCatchRepro', () => () => null);
 
 ## Workaround
 
-Hoist to `let` before the try/catch — Babel lowers `let` → `var`:
+Avoid `var` declarations referencing catch bindings inside inner `try/catch` blocks in deferred closures. Either:
 
 ```javascript
+// Option 1: access directly (no var)
+catch (error) {
+  setTimeout(function () {
+    console.log(error.message);  // works
+  }, 0);
+}
+
+// Option 2: hoist to let before try/catch (Babel lowers let → var)
 let capturedError;
-try {
-  throw new Error('test');
-} catch (error) {
+try { ... } catch (error) {
   capturedError = error;
   setTimeout(function () {
-    console.log(capturedError.message); // works
+    console.log(capturedError.message);  // works
   }, 0);
 }
 ```
 
 ## Environment
 
-- React Native 0.78.x, 0.79.7 (also likely all versions through 0.85.0)
+- React Native 0.78.x, 0.79.7
 - Hermes (default engine)
-- iOS simulator, Xcode 26.4
+- iOS and Android
 - Standalone Hermes CLI does NOT reproduce
