@@ -42,7 +42,7 @@ npx @react-native-community/cli init HermesCatchRepro --version 0.79.7
 Replace `index.js`:
 
 ```javascript
-import {AppRegistry} from 'react-native';
+import {AppRegistry, Alert} from 'react-native';
 
 try {
   throw new Error('catch-binding-bug');
@@ -50,15 +50,34 @@ try {
   setTimeout(function () {
     try {
       var msg = error.message;
-      console.log(msg);
+      Alert.alert('PASS', msg);
     } catch (e) {
-      console.error('BUG:', e.message);
+      Alert.alert('BUG REPRODUCED', e.message + '\n\n' + (e.stack || 'no stack'));
     }
-  }, 100);
+  }, 500);
 }
 
 AppRegistry.registerComponent('HermesCatchRepro', () => () => null);
 ```
+
+### Stack trace
+
+```
+ReferenceError: Property 'error' doesn't exist
+    at anonymous (http://localhost:8082/index.bundle?platform=ios&dev=true&lazy=true&minify=false&inlineSourceMap=false&modulesOnly=false&runModule=true&excludeSource=true&sourcePaths=url-server&app=org.reactjs.native.example.HermesCatchRepro:1293:19)
+```
+
+Line 1293 maps to `var msg = error.message;` in the Metro dev bundle.
+
+### Pre-compiled bytecode does NOT reproduce
+
+```bash
+hermesc -emit-binary -out index.hbc index.bundle
+# serve index.hbc to the app instead of index.bundle
+# → PASS (catch binding accessible)
+```
+
+The bug is in Hermes's **on-the-fly JS compiler** only. The `hermesc` AOT compiler produces correct bytecode for the same input.
 
 ## Workaround
 
